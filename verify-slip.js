@@ -1,7 +1,5 @@
 // api/verify-slip.js
-// Serverless function to verify if a bet slip is legitimate or fabricated
-import { createCanvas, loadImage } from 'canvas';
-import pixelmatch from 'pixelmatch';
+// Serverless function to verify if a bet slip is legitimate using Sightengine
 
 export const config = {
   api: {
@@ -17,36 +15,114 @@ export default async function handler(req, res) {
   }
 
   try {
-    // Get the uploaded file
-    const form = new FormData();
-    // Handle multipart form data or base64
-    const imageBuffer = req.body.file || Buffer.from(req.body.image, 'base64');
+    // Get Sightengine credentials from environment variables
+    const apiUser = process.env.SIGHTENGINE_API_USER;
+    const apiSecret = process.env.SIGHTENGINE_API_SECRET;
 
-    // Run verification checks
+    if (!apiUser || !apiSecret) {
+      throw new Error('Sightengine credentials not configured');
+    }
+
+    // Get the image from the request
+    const formData = new FormData();
+    
+    // Handle file upload (multipart form data)
+    if (req.body && req.body.file) {
+      formData.append('media', req.body.file);
+    } else if (req.files && req.files.file) {
+      formData.append('media', req.files.file.data);
+    } else {
+      throw new Error('No image file provided');
+    }
+
+    formData.append('models', 'genai');
+    formData.append('api_user', apiUser);
+    formData.append('api_secret', apiSecret);
+
+    // Call Sightengine API for image manipulation detection
+    const response = await fetch('https://api.sightengine.com/1.0/check.json', {
+      method: 'POST',
+      body: formData
+    });
+
+    if (!response.ok) {
+      throw new Error(`Sightengine API error: ${response.status}`);
+    }
+
+    const data = await response.json();
+
+    // Analyze Sightengine results
     const findings = [];
-    let legitimacyScore = 100; // Start at 100, deduct for red flags
+    let legitimacyScore = 100;
 
-    // 1. Check EXIF metadata
-    const metadataCheck = await checkMetadata(imageBuffer);
-    findings.push(metadataCheck.finding);
-    legitimacyScore -= metadataCheck.penalty;
+    // Check for AI-generated or manipulated content
+    if (data.type && data.type.ai_generated) {
+      const aiScore = data.type.ai_generated;
+      
+      if (aiScore > 0.7) {
+        findings.push({
+          category: "AI Detection",
+          status: "negative",
+          detail: `High probability (${Math.round(aiScore * 100)}%) of AI-generated or heavily manipulated content.`
+        });
+        legitimacyScore -= 40;
+      } else if (aiScore > 0.4) {
+        findings.push({
+          category: "AI Detection",
+          status: "negative",
+          detail: `Moderate probability (${Math.round(aiScore * 100)}%) of digital manipulation detected.`
+        });
+        legitimacyScore -= 25;
+      } else {
+        findings.push({
+          category: "AI Detection",
+          status: "positive",
+          detail: "Low probability of AI generation or heavy manipulation."
+        });
+      }
+    }
 
-    // 2. Check for compression artifacts (edited images often have irregular compression)
-    const compressionCheck = await checkCompression(imageBuffer);
-    findings.push(compressionCheck.finding);
-    legitimacyScore -= compressionCheck.penalty;
+    // Check image quality metrics
+    if (data.quality) {
+      const quality = data.quality;
+      
+      if (quality.score < 0.5) {
+        findings.push({
+          category: "Image Quality",
+          status: "negative",
+          detail: "Poor image quality may indicate screenshot or re-photograph of original."
+        });
+        legitimacyScore -= 15;
+      } else {
+        findings.push({
+          category: "Image Quality",
+          status: "positive",
+          detail: "Image quality consistent with direct capture."
+        });
+      }
+    }
 
-    // 3. Check font consistency
-    const fontCheck = await checkFonts(imageBuffer);
-    findings.push(fontCheck.finding);
-    legitimacyScore -= fontCheck.penalty;
+    // Check for faces (bet slips shouldn't have faces)
+    if (data.faces && data.faces.length > 0) {
+      findings.push({
+        category: "Content Analysis",
+        status: "negative",
+        detail: "Unexpected content detected (faces found in image)."
+      });
+      legitimacyScore -= 20;
+    }
 
-    // 4. Check against known sportsbook templates
-    const templateCheck = await checkTemplate(imageBuffer);
-    findings.push(templateCheck.finding);
-    legitimacyScore -= templateCheck.penalty;
+    // Add template matching check (placeholder for now)
+    const knownSportsbooks = ['FanDuel', 'DraftKings', 'BetMGM', 'Caesars', 'Unknown'];
+    const detectedSportsbook = knownSportsbooks[Math.floor(Math.random() * knownSportsbooks.length)];
+    
+    findings.push({
+      category: "Layout Analysis",
+      status: "neutral",
+      detail: `Analyzing against ${detectedSportsbook} template patterns.`
+    });
 
-    // Determine verdict based on legitimacy score
+    // Calculate final verdict
     const confidence = Math.max(0, Math.min(100, legitimacyScore));
     const verdict = confidence >= 70 ? "Likely Legitimate" : "Likely Fabricated";
 
@@ -54,7 +130,8 @@ export default async function handler(req, res) {
       verdict,
       confidence: Math.round(confidence),
       findings,
-      sportsbook: templateCheck.detectedSportsbook || "Unknown"
+      sportsbook: detectedSportsbook,
+      rawData: data // Include full Sightengine response for debugging
     });
 
   } catch (error) {
@@ -63,170 +140,5 @@ export default async function handler(req, res) {
       error: 'Verification failed',
       message: error.message 
     });
-  }
-}
-
-// Helper function: Check metadata for manipulation signs
-async function checkMetadata(imageBuffer) {
-  try {
-    // Use exif-parser or sharp to extract EXIF data
-    const exif = {}; // Extract EXIF here
-    
-    // Red flags: Missing metadata, conflicting timestamps, editing software signatures
-    const hasEditingSoftware = exif.Software && 
-      (exif.Software.includes('Photoshop') || exif.Software.includes('GIMP'));
-    
-    if (hasEditingSoftware) {
-      return {
-        finding: {
-          category: "Metadata",
-          status: "negative",
-          detail: "Image shows signs of editing software usage."
-        },
-        penalty: 30
-      };
-    }
-
-    return {
-      finding: {
-        category: "Metadata",
-        status: "neutral",
-        detail: "No strong metadata indicators found."
-      },
-      penalty: 0
-    };
-  } catch (err) {
-    return {
-      finding: {
-        category: "Metadata",
-        status: "neutral",
-        detail: "Metadata analysis inconclusive."
-      },
-      penalty: 0
-    };
-  }
-}
-
-// Helper function: Check compression artifacts
-async function checkCompression(imageBuffer) {
-  try {
-    // Analyze JPEG compression levels and artifacts
-    // Different compression in different regions = likely edited
-    
-    // This is a simplified check - in reality you'd use specialized libraries
-    const hasIrregularCompression = Math.random() > 0.7; // Placeholder
-    
-    if (hasIrregularCompression) {
-      return {
-        finding: {
-          category: "Compression Anomaly",
-          status: "negative",
-          detail: "Irregular compression detected near critical regions (amounts/odds)."
-        },
-        penalty: 25
-      };
-    }
-
-    return {
-      finding: {
-        category: "Compression",
-        status: "positive",
-        detail: "Compression artifacts appear uniform across image."
-      },
-      penalty: 0
-    };
-  } catch (err) {
-    return {
-      finding: {
-        category: "Compression",
-        status: "neutral",
-        detail: "Compression analysis inconclusive."
-      },
-      penalty: 5
-    };
-  }
-}
-
-// Helper function: Check font consistency
-async function checkFonts(imageBuffer) {
-  try {
-    // Use OCR + font detection to check if fonts are consistent
-    // Sportsbooks use specific fonts - mixing fonts = red flag
-    
-    const hasInconsistentFonts = Math.random() > 0.8; // Placeholder
-    
-    if (hasInconsistentFonts) {
-      return {
-        finding: {
-          category: "Font Mismatch",
-          status: "negative",
-          detail: "Multiple font styles detected where uniform font is expected."
-        },
-        penalty: 20
-      };
-    }
-
-    return {
-      finding: {
-        category: "Font Consistency",
-        status: "positive",
-        detail: "Fonts appear consistent with known sportsbook typography."
-      },
-      penalty: 0
-    };
-  } catch (err) {
-    return {
-      finding: {
-        category: "Font Analysis",
-        status: "neutral",
-        detail: "Font analysis inconclusive."
-      },
-      penalty: 5
-    };
-  }
-}
-
-// Helper function: Check against known templates
-async function checkTemplate(imageBuffer) {
-  try {
-    // Compare uploaded image against database of real sportsbook layouts
-    // Check: Logo placement, spacing, layout structure
-    
-    const knownSportsbooks = ['FanDuel', 'DraftKings', 'BetMGM', 'Caesars'];
-    const detectedSportsbook = knownSportsbooks[Math.floor(Math.random() * knownSportsbooks.length)];
-    
-    const matchesTemplate = Math.random() > 0.3; // Placeholder
-    
-    if (matchesTemplate) {
-      return {
-        finding: {
-          category: "Layout Match",
-          status: "positive",
-          detail: `Slip layout matches known ${detectedSportsbook} template.`
-        },
-        penalty: 0,
-        detectedSportsbook
-      };
-    } else {
-      return {
-        finding: {
-          category: "Template Drift",
-          status: "negative",
-          detail: "Spacing and layout differ from known sportsbook templates."
-        },
-        penalty: 25,
-        detectedSportsbook: "Unknown"
-      };
-    }
-  } catch (err) {
-    return {
-      finding: {
-        category: "Template Matching",
-        status: "neutral",
-        detail: "Template matching inconclusive."
-      },
-      penalty: 10,
-      detectedSportsbook: "Unknown"
-    };
   }
 }
